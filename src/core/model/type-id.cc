@@ -13,6 +13,7 @@
 #include "trace-source-accessor.h"
 
 #include <map>
+#include <mutex>
 #include <vector>
 
 /**
@@ -346,6 +347,23 @@ class IidManager : public Singleton<IidManager>
     /** The by-hash index. */
     hashmap_t m_hashmap;
 
+#ifdef NS3_MTP
+    /**
+     * Mutex serializing access to m_information / m_namemap / m_hashmap
+     * and to each IidInformation's attributes / traceSources vectors.
+     * Lazy first-time TypeId resolution from a worker thread (e.g.,
+     * `CreateObjectWithAttributes<DropTailQueue<QueueDiscItem>>` fired
+     * by FifoQueueDisc::CheckConfig during a parallel Run) goes through
+     * IidManager::AddAttribute / AllocateUid, which push_back into
+     * vectors that another worker may be iterating via GetAttribute.
+     * Without this mutex, the vector reallocation produces torn
+     * Ptr<AttributeChecker> reads → vtable corruption in
+     * ObjectBase::ConstructSelf. Recursive because some methods on this
+     * class call other methods on it (AllocateUid -> GetUid).
+     */
+    mutable std::recursive_mutex m_mu;
+#endif
+
     /** IidManager constants. */
     enum
     {
@@ -358,6 +376,20 @@ class IidManager : public Singleton<IidManager>
         HashChainFlag = 0x80000000
     };
 };
+
+/**
+ * Convenience macro to take the IidManager mutex (recursive) under
+ * NS3_MTP, no-op otherwise. Inserted at the top of every IidManager
+ * public method that touches m_information / m_namemap / m_hashmap or
+ * the per-entry attributes/traceSources vectors. Recursive because
+ * AllocateUid calls GetUid internally; flat-locking those would
+ * deadlock.
+ */
+#ifdef NS3_MTP
+#define IID_LOCK_GUARD std::lock_guard<std::recursive_mutex> _iid_lk(m_mu)
+#else
+#define IID_LOCK_GUARD do {} while (0)
+#endif
 
 // static
 TypeId::hash_t
@@ -383,6 +415,7 @@ IidManager::Hasher(const std::string name)
 uint16_t
 IidManager::AllocateUid(std::string name)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << name);
     // Type names are definitive: equal names are equal types
     NS_ABORT_MSG_UNLESS(m_namemap.count(name) == 0,
@@ -458,6 +491,7 @@ IidManager::AllocateUid(std::string name)
 IidManager::IidInformation*
 IidManager::LookupInformation(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     NS_ASSERT_MSG(uid <= m_information.size() && uid != 0,
                   "The uid " << uid << " for this TypeId is invalid");
@@ -468,6 +502,7 @@ IidManager::LookupInformation(uint16_t uid) const
 void
 IidManager::AddDeprecatedName(uint16_t uid, const std::string& name)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << name);
     IidInformation* info = LookupInformation(uid);
     NS_ASSERT_MSG(info->deprecatedName.empty(),
@@ -481,6 +516,7 @@ IidManager::AddDeprecatedName(uint16_t uid, const std::string& name)
 void
 IidManager::SetParent(uint16_t uid, uint16_t parent)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << parent);
     NS_ASSERT(parent <= m_information.size());
     IidInformation* information = LookupInformation(uid);
@@ -490,6 +526,7 @@ IidManager::SetParent(uint16_t uid, uint16_t parent)
 void
 IidManager::SetGroupName(uint16_t uid, std::string groupName)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << groupName);
     IidInformation* information = LookupInformation(uid);
     information->groupName = groupName;
@@ -498,6 +535,7 @@ IidManager::SetGroupName(uint16_t uid, std::string groupName)
 void
 IidManager::SetSize(uint16_t uid, std::size_t size)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << size);
     IidInformation* information = LookupInformation(uid);
     information->size = size;
@@ -506,6 +544,7 @@ IidManager::SetSize(uint16_t uid, std::size_t size)
 void
 IidManager::HideFromDocumentation(uint16_t uid)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     information->mustHideFromDocumentation = true;
@@ -514,6 +553,7 @@ IidManager::HideFromDocumentation(uint16_t uid)
 void
 IidManager::AddConstructor(uint16_t uid, Callback<ObjectBase*> callback)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << &callback);
     IidInformation* information = LookupInformation(uid);
     if (information->hasConstructor)
@@ -527,6 +567,7 @@ IidManager::AddConstructor(uint16_t uid, Callback<ObjectBase*> callback)
 uint16_t
 IidManager::GetUid(std::string name) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << name);
     uint16_t uid = 0;
     auto it = m_namemap.find(name);
@@ -541,6 +582,7 @@ IidManager::GetUid(std::string name) const
 uint16_t
 IidManager::GetUid(TypeId::hash_t hash) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << hash);
     auto it = m_hashmap.find(hash);
     uint16_t uid = 0;
@@ -555,6 +597,7 @@ IidManager::GetUid(TypeId::hash_t hash) const
 std::string
 IidManager::GetName(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     NS_LOG_LOGIC(IIDL << information->name);
@@ -564,6 +607,7 @@ IidManager::GetName(uint16_t uid) const
 std::string
 IidManager::GetDeprecatedName(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     NS_LOG_LOGIC(IIDL << information->deprecatedName);
@@ -573,6 +617,7 @@ IidManager::GetDeprecatedName(uint16_t uid) const
 TypeId::hash_t
 IidManager::GetHash(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     TypeId::hash_t hash = information->hash;
@@ -583,6 +628,7 @@ IidManager::GetHash(uint16_t uid) const
 uint16_t
 IidManager::GetParent(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     uint16_t pid = information->parent;
@@ -593,6 +639,7 @@ IidManager::GetParent(uint16_t uid) const
 std::string
 IidManager::GetGroupName(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     NS_LOG_LOGIC(IIDL << information->groupName);
@@ -602,6 +649,7 @@ IidManager::GetGroupName(uint16_t uid) const
 std::size_t
 IidManager::GetSize(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     std::size_t size = information->size;
@@ -612,6 +660,7 @@ IidManager::GetSize(uint16_t uid) const
 Callback<ObjectBase*>
 IidManager::GetConstructor(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     if (!information->hasConstructor)
@@ -625,6 +674,7 @@ IidManager::GetConstructor(uint16_t uid) const
 bool
 IidManager::HasConstructor(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     bool hasC = information->hasConstructor;
@@ -635,6 +685,7 @@ IidManager::HasConstructor(uint16_t uid) const
 uint16_t
 IidManager::GetRegisteredN() const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << m_information.size());
     return static_cast<uint16_t>(m_information.size());
 }
@@ -642,6 +693,7 @@ IidManager::GetRegisteredN() const
 uint16_t
 IidManager::GetRegistered(uint16_t i) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << i);
     return i + 1;
 }
@@ -649,6 +701,7 @@ IidManager::GetRegistered(uint16_t i) const
 bool
 IidManager::HasAttribute(uint16_t uid, std::string name)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << name);
     IidInformation* information = LookupInformation(uid);
     while (true)
@@ -686,6 +739,7 @@ IidManager::AddAttribute(uint16_t uid,
                          TypeId::SupportLevel supportLevel,
                          const std::string& supportMsg)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << name << help << flags << initialValue << accessor << checker
                         << supportLevel << supportMsg);
     IidInformation* information = LookupInformation(uid);
@@ -719,6 +773,7 @@ IidManager::SetAttributeInitialValue(uint16_t uid,
                                      std::size_t i,
                                      Ptr<const AttributeValue> initialValue)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << i << initialValue);
     IidInformation* information = LookupInformation(uid);
     NS_ASSERT(i < information->attributes.size());
@@ -728,6 +783,7 @@ IidManager::SetAttributeInitialValue(uint16_t uid,
 std::size_t
 IidManager::GetAttributeN(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     std::size_t size = information->attributes.size();
@@ -738,6 +794,7 @@ IidManager::GetAttributeN(uint16_t uid) const
 TypeId::AttributeInformation
 IidManager::GetAttribute(uint16_t uid, std::size_t i) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << i);
     IidInformation* information = LookupInformation(uid);
     NS_ASSERT(i < information->attributes.size());
@@ -748,6 +805,7 @@ IidManager::GetAttribute(uint16_t uid, std::size_t i) const
 bool
 IidManager::HasTraceSource(uint16_t uid, std::string name)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << name);
     IidInformation* information = LookupInformation(uid);
     while (true)
@@ -783,6 +841,7 @@ IidManager::AddTraceSource(uint16_t uid,
                            TypeId::SupportLevel supportLevel,
                            const std::string& supportMsg)
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << name << help << accessor << callback << supportLevel
                         << supportMsg);
     IidInformation* information = LookupInformation(uid);
@@ -805,6 +864,7 @@ IidManager::AddTraceSource(uint16_t uid,
 std::size_t
 IidManager::GetTraceSourceN(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     std::size_t size = information->traceSources.size();
@@ -815,6 +875,7 @@ IidManager::GetTraceSourceN(uint16_t uid) const
 TypeId::TraceSourceInformation
 IidManager::GetTraceSource(uint16_t uid, std::size_t i) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid << i);
     IidInformation* information = LookupInformation(uid);
     NS_ASSERT(i < information->traceSources.size());
@@ -825,6 +886,7 @@ IidManager::GetTraceSource(uint16_t uid, std::size_t i) const
 bool
 IidManager::MustHideFromDocumentation(uint16_t uid) const
 {
+    IID_LOCK_GUARD;
     NS_LOG_FUNCTION(IID << uid);
     IidInformation* information = LookupInformation(uid);
     bool hide = information->mustHideFromDocumentation;
